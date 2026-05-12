@@ -14,14 +14,16 @@ Sentry.init({
 });
 
 import './process/utils/configureConsoleLog';
-import { app, BrowserWindow, nativeImage, net, powerMonitor, protocol, screen } from 'electron';
+import { app, BrowserWindow, nativeImage, net, powerMonitor, protocol, screen, shell } from 'electron';
 import fixPath from 'fix-path';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
 import { initMainAdapterWithWindow } from './common/adapter/main';
 import { ipcBridge } from './common';
-import { AION_ASSET_PROTOCOL } from '@process/extensions';
+import { AION_ASSET_PROTOCOL, ExtensionRegistry } from '@process/extensions';
+import { parseAssetUrl } from '@process/extensions/protocol/assetProtocol';
+import { isPathWithinDirectory } from '@process/extensions/sandbox/pathSafety';
 import { initializeProcess } from './process';
 import { ProcessConfig } from './process/utils/initStorage';
 import { loadShellEnvironmentAsync, logEnvironmentDiagnostics, mergePaths } from './process/utils/shellEnv';
@@ -202,6 +204,17 @@ let appReadyDone = false;
 
 let mainWindow: BrowserWindow;
 
+const SAFE_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+
+const isSafeExternalUrl = (rawUrl: string): boolean => {
+  try {
+    const url = new URL(rawUrl);
+    return SAFE_EXTERNAL_PROTOCOLS.has(url.protocol);
+  } catch {
+    return false;
+  }
+};
+
 const createWindow = ({ showOnReady = true }: { showOnReady?: boolean } = {}): void => {
   console.log('[AionUi] Creating main window...');
   // Get primary display size
@@ -252,6 +265,10 @@ const createWindow = ({ showOnReady = true }: { showOnReady?: boolean } = {}): v
       : { frame: false }),
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
       webviewTag: true, // 启用 webview 标签用于 HTML 预览 / Enable webview tag for HTML preview
     },
   });
@@ -289,6 +306,37 @@ const createWindow = ({ showOnReady = true }: { showOnReady?: boolean } = {}): v
 
   setupZoomForWindow(mainWindow);
   registerWindowMaximizeListeners(mainWindow);
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const rendererUrl = process.env['ELECTRON_RENDERER_URL'];
+    const fallbackFile = pathToFileURL(path.join(__dirname, '../renderer/index.html')).href;
+    const isAllowedAppNavigation =
+      (!app.isPackaged && rendererUrl && url.startsWith(rendererUrl)) || url === fallbackFile;
+
+    if (!isAllowedAppNavigation) {
+      event.preventDefault();
+      if (isSafeExternalUrl(url)) {
+        void shell.openExternal(url);
+      }
+    }
+  });
+
+  mainWindow.webContents.on('will-attach-webview', (_event, webPreferences, params) => {
+    delete webPreferences.preload;
+    delete (webPreferences as { preloadURL?: string }).preloadURL;
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+    webPreferences.sandbox = true;
+    webPreferences.webSecurity = true;
+    webPreferences.allowRunningInsecureContent = false;
+    params.allowpopups = 'false';
+  });
 
   // Initialize auto-updater service (skip when disabled via env, e.g. E2E / CI)
   // 初始化自动更新服务（通过环境变量禁用时跳过，例如 E2E / CI 场景）
@@ -415,16 +463,29 @@ const handleAppReady = async (): Promise<void> => {
   // Converts aion-asset://asset/C:/path/to/file.svg → file:///C:/path/to/file.svg
   // and serves the local file through Electron's net module.
   protocol.handle(AION_ASSET_PROTOCOL, (request) => {
-    const url = new URL(request.url);
-    // pathname is /C:/path/to/file.svg — strip leading slash on Windows
-    let filePath = decodeURIComponent(url.pathname);
-    if (process.platform === 'win32' && filePath.startsWith('/') && /^\/[A-Za-z]:/.test(filePath)) {
-      filePath = filePath.slice(1);
+    const filePath = parseAssetUrl(request.url);
+    if (!filePath || !path.isAbsolute(filePath)) {
+      console.warn(`[aion-asset] Rejected invalid asset URL: ${request.url}`);
+      return new Response('Invalid asset URL', { status: 400 });
     }
-    if (!fs.existsSync(filePath)) {
-      console.warn(`[aion-asset] File not found: ${request.url} -> ${filePath}`);
+
+    const normalizedPath = path.resolve(filePath);
+    const allowedRoots = ExtensionRegistry.getInstance()
+      .getLoadedExtensions()
+      .map((ext) => path.resolve(ext.directory));
+
+    const matchingRoot = allowedRoots.find((root) => isPathWithinDirectory(normalizedPath, root));
+    if (!matchingRoot) {
+      console.warn(`[aion-asset] Rejected path outside extension roots: ${request.url}`);
+      return new Response('Access denied', { status: 403 });
     }
-    return net.fetch(pathToFileURL(filePath).href);
+
+    if (!fs.existsSync(normalizedPath) || !fs.statSync(normalizedPath).isFile()) {
+      console.warn(`[aion-asset] File not found: ${request.url} -> ${normalizedPath}`);
+      return new Response('Asset not found', { status: 404 });
+    }
+
+    return net.fetch(pathToFileURL(normalizedPath).href);
   });
 
   // Set dock icon in development mode on macOS

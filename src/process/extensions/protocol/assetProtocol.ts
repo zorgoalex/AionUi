@@ -24,6 +24,29 @@ export const AION_ASSET_PROTOCOL = 'aion-asset';
 export const AION_ASSET_HOST = 'asset';
 
 /**
+ * Parse and validate an aion-asset:// URL before mapping it to a local path.
+ */
+export function parseAssetUrl(rawUrl: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== `${AION_ASSET_PROTOCOL}:` || parsed.hostname !== AION_ASSET_HOST) {
+    return null;
+  }
+
+  let filePath = decodeURIComponent(parsed.pathname);
+  if (process.platform === 'win32' && filePath.startsWith('/') && /^\/[A-Za-z]:/.test(filePath)) {
+    filePath = filePath.slice(1);
+  }
+
+  return filePath;
+}
+
+/**
  * Convert an absolute file path to an aion-asset:// URL.
  * Normalizes backslashes to forward slashes for cross-platform compatibility.
  */

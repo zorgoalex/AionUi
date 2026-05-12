@@ -13,6 +13,17 @@ import * as path from 'path';
 
 const execAsync = promisify(exec);
 
+const SAFE_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+
+function isSafeExternalUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    return SAFE_EXTERNAL_PROTOCOLS.has(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Check if a command exists in PATH
  */
@@ -226,12 +237,11 @@ export function initShellBridge(): void {
   });
 
   ipcBridge.shell.openExternal.provider(async (url) => {
-    try {
-      new URL(url);
-    } catch {
-      console.warn(`[shellBridge] Invalid URL passed to openExternal: ${url}`);
+    if (!isSafeExternalUrl(url)) {
+      console.warn(`[shellBridge] Rejected unsafe URL passed to openExternal: ${url}`);
       return;
     }
+
     try {
       await shell.openExternal(url);
     } catch (error) {
